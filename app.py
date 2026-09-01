@@ -1,169 +1,149 @@
-import streamlit as st
+import os
 import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-from datetime import datetime
-import urllib3
-import re
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+from xml.etree import ElementTree
+from google import genai
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
 
-# 關閉 SSL 憑證警告資訊
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# 1. 設定環境變數
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
+LINE_USER_ID = os.environ.get('LINE_USER_ID')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
-# 設定網頁標題與佈局
-st.set_page_config(page_title="總統府行程爬蟲工具", layout="wide")
-st.title("🇹🇼 中華民國總統府 - 行程解析工具")
+# 自訂搜尋關鍵字與時間範圍
+KEYWORDS = "基隆"  # 可依需求修改關鍵字，多個關鍵字可用逗號分隔，如 "基隆, 台電"
+SEARCH_HOURS = 24
 
-# 側邊欄配置
-st.sidebar.header("設定抓取日期")
-target_date = st.sidebar.date_input("選擇日期", datetime.today())
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 
-def parse_raw_text_to_table(scraped_date):
-    """
-    精確鎖定特定日期區塊，切分時間、官階、行程內容
-    """
-    date_str = scraped_date.strftime("%Y-%m-%d")
-    base_url = f"https://www.president.gov.tw/Page/37?FDate={date_str}&EDate={date_str}"
+def shorten_url(url):
+    """將長網址縮短"""
+    try:
+        api_url = f"http://tinyurl.com/api-create.php?url={requests.utils.quote(url)}"
+        res = requests.get(api_url, timeout=5)
+        if res.status_code == 200:
+            return res.text
+    except Exception:
+        pass
+    return url
+
+def fetch_google_news(keywords_str, hours):
+    """爬取近指定小時內的新聞"""
+    keyword_groups = [g.strip() for g in keywords_str.replace('，', ',').split(',') if g.strip()]
+    all_news = []
     
-    # 轉換為民國年格式字串以匹配網頁文本
-    roc_year_str = f"{scraped_date.year - 1911}年"
-    month_str = f"{scraped_date.month}月"
-    day_str = f"{scraped_date.day}"
+    now_utc = datetime.now(timezone.utc)
+    time_limit_utc = now_utc - timedelta(hours=int(hours))
+    headers = {'User-Agent': 'Mozilla/5.0'}
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
-    }
+    for group in keyword_groups:
+        url = f'https://news.google.com/rss/search?q={requests.utils.quote(group.replace(" ", " AND "))}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
+        try:
+            res = requests.get(url, timeout=15, headers=headers)
+            if res.status_code == 200:
+                tree = ElementTree.fromstring(res.content)
+                for item in tree.findall('.//item'):
+                    title = item.find('title').text if item.find('title') is not None else ''
+                    pub_date_str = item.find('pubDate').text
+                    
+                    pub_date_dt = parsedate_to_datetime(pub_date_str)
+                    pub_date_tw = pub_date_dt.astimezone(timezone(timedelta(hours=8)))
+                    
+                    if pub_date_dt > time_limit_utc:
+                        all_news.append({
+                            'title': title,
+                            'time': pub_date_tw.strftime('%m/%d %H:%M'),
+                            'source': item.find('source').text if item.find('source') is not None else '網路',
+                            'link': item.find('link').text,
+                            'timestamp': pub_date_tw
+                        })
+        except Exception as e:
+            print(f"DEBUG: 解析 RSS 失敗: {e}")
+            continue
 
-    # 儲存結構
-    parsed_data = {
-        "總統": {"時間": [], "行程內容": []},
-        "副總統": {"時間": [], "行程內容": []},
-        "總統府": {"時間": [], "行程內容": []}
-    }
+    # 去重複
+    unique_news = []
+    seen_titles = set()
+    for item in all_news:
+        if item['title'] not in seen_titles:
+            seen_titles.add(item['title'])
+            unique_news.append(item)
+            
+    return sorted(unique_news, key=lambda x: x['timestamp'], reverse=True)
+
+def generate_ai_summary(news_list):
+    """將所有新聞打包交給 AI 生成整體總結報告（單次 API 呼叫）"""
+    if not GEMINI_API_KEY:
+        return "（未設定 GEMINI_API_KEY，無法生成總結）"
+    if not news_list:
+        return "近時間內無相關新聞，無需總結。"
+
+    # 彙整所有新聞清單
+    raw_news_text = ""
+    for idx, item in enumerate(news_list, 1):
+        raw_news_text += f"{idx}. [{item['source']}] {item['title']} ({item['time']})\n"
+
+    prompt = f"""
+以下是過去 {SEARCH_HOURS} 小時內爬取到的新聞標題列表：
+
+{raw_news_text}
+
+請扮演專業資訊分析師，針對上述新聞進行整體綜合總結：
+1. **重點速覽**：歸納出 3~5 個核心主題/事件重點（條列說明）。
+2. **輿情與關注焦點**：是否有需要特別留意、追蹤或高關注度的突發/重要議題。
+3. **結論簡評**：用 1-2 句話做整體總結。
+
+要求：文字精煉、客觀，直接輸出總結報告內容即可。
+"""
 
     try:
-        res = requests.get(base_url, headers=headers, timeout=15, verify=False)
-        if res.status_code == 200:
-            res.encoding = 'utf-8'
-            soup = BeautifulSoup(res.text, "html.parser")
-            body = soup.find("body")
-            
-            if body:
-                raw_text = body.get_text(separator="\n", strip=True)
-                lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
-                
-                in_target_section = False
-                current_role = None
-                i = 0
-                
-                while i < len(lines):
-                    # 辨識日期標頭結構（例如：115年 -> 6月 -> 23 -> 日）
-                    if i + 3 < len(lines) and lines[i].endswith("年") and lines[i+1].endswith("月") and lines[i+3] == "日":
-                        # 檢查是否為目標日期
-                        if lines[i] == roc_year_str and lines[i+1] == month_str and lines[i+2] == day_str:
-                            in_target_section = True
-                            i += 4
-                            if i < len(lines) and lines[i].startswith("星期"):
-                                i += 1
-                            continue
-                        else:
-                            # 若原本在目標區塊內，一旦遇到下一個日期標頭，代表該日資料結束，直接中斷
-                            if in_target_section:
-                                break
-                            i += 4
-                            continue
-                    
-                    # 僅在目標日期區塊內進行資料擷取
-                    if in_target_section:
-                        if lines[i] in parsed_data.keys():
-                            current_role = lines[i]
-                            i += 1
-                            
-                            while i < len(lines):
-                                # 內層防禦：若遇到下一個日期區塊，跳出交由外層中斷
-                                if i + 3 < len(lines) and lines[i].endswith("年") and lines[i+1].endswith("月") and lines[i+3] == "日":
-                                    break
-                                # 若遇到下一個官階，跳出切換官階
-                                if lines[i] in parsed_data.keys():
-                                    break
-                                    
-                                line = lines[i]
-                                if line == "無公開行程":
-                                    parsed_data[current_role]["時間"].append("-")
-                                    parsed_data[current_role]["行程內容"].append("無公開行程")
-                                    i += 1
-                                elif re.match(r"^\d{2}:\d{2}", line):  # 辨識時間格式
-                                    time_val = line
-                                    # 讀取下一行作為行程內容，需排除官階、新時間、或新日期標頭的干擾
-                                    if i + 1 < len(lines):
-                                        next_line = lines[i+1]
-                                        is_separator = (next_line in parsed_data.keys() or 
-                                                        re.match(r"^\d{2}:\d{2}", next_line) or 
-                                                        (next_line.endswith("年") and i + 4 < len(lines) and lines[i+2].endswith("月")))
-                                        if not is_separator:
-                                            parsed_data[current_role]["時間"].append(time_val)
-                                            parsed_data[current_role]["行程內容"].append(next_line)
-                                            i += 2
-                                            continue
-                                    parsed_data[current_role]["時間"].append(time_val)
-                                    parsed_data[current_role]["行程內容"].append("")
-                                    i += 1
-                                else:
-                                    # 忽略其餘無關雜訊（如新聞標題）
-                                    i += 1
-                        else:
-                            i += 1
-                    else:
-                        i += 1
-    except Exception as e:
-        st.error(f"連線或解析時發生錯誤: {e}")
-
-    # 建立輸出結果
-    final_rows = []
-    for role in ["總統", "副總統", "總統府"]:
-        times = parsed_data[role]["時間"]
-        contents = parsed_data[role]["行程內容"]
-        
-        # 清除防呆殘留
-        if len(times) > 1 and "-" in times:
-            idx = times.index("-")
-            times.pop(idx)
-            contents.pop(idx)
-            
-        if times and contents:
-            joined_time = "\n".join(times)
-            joined_content = "\n".join(contents)
-        else:
-            joined_time = "-"
-            joined_content = "無公開行程"
-            
-        final_rows.append({
-            "時間": joined_time,
-            "官階": role,
-            "行程內容": joined_content
-        })
-        
-    return final_rows
-
-# 執行按鈕
-if st.sidebar.button("開始同步並篩選資料"):
-    with st.spinner(f"正在解析 {target_date} 的行程數據..."):
-        
-        result_list = parse_raw_text_to_table(target_date)
-        df = pd.DataFrame(result_list)
-        
-        st.success(f"查詢成功！已完成 {target_date} 的行程解析。")
-        
-        # 依據要求調整顯示欄位：時間、官階、行程內容
-        st.dataframe(df[["時間", "官階", "行程內容"]], use_container_width=True)
-        
-        # 下載按鈕
-        csv = df[["時間", "官階", "行程內容"]].to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="匯出此表格為 CSV",
-            data=csv,
-            file_name=f"president_schedule_{target_date}.csv",
-            mime="text/csv",
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=prompt,
         )
-else:
-    st.info("請於左側選擇日期後，點擊「開始同步並篩選資料」按鈕。")
+        return response.text.strip()
+    except Exception as e:
+        print(f"DEBUG: AI 生成失敗: {e}")
+        return "（AI 總結生成失敗）"
+
+def main():
+    try:
+        print("開始爬取新聞...")
+        news = fetch_google_news(KEYWORDS, SEARCH_HOURS)
+        print(f"共爬到 {len(news)} 則新聞。")
+        
+        now_tw = datetime.now(timezone.utc) + timedelta(hours=8)
+        now_str = now_tw.strftime("%Y-%m-%d %H:%M")
+
+        if not news:
+            message = f"【近 {SEARCH_HOURS} 小時新聞總結報告】\n搜尋時間：{now_str}\n\n❌ 查無相關新聞。"
+        else:
+            print("正在呼叫 AI 進行總結...")
+            ai_summary = generate_ai_summary(news)
+            
+            # 建立附帶原始新聞列表的推播內容
+            news_links_block = "\n".join([
+                f"{i}. [{item['source']}] {item['title']}\n   {shorten_url(item['link'])}"
+                for i, item in enumerate(news[:10], 1)  # 附錄最多展示前 10 則
+            ])
+            
+            message = f"【近 {SEARCH_HOURS} 小時新聞總結報告】\n時間：{now_str}\n✅ 共彙整 {len(news)} 則新聞\n\n"
+            message += f"🤖 【AI 綜合總結】\n{ai_summary}\n\n"
+            message += f"-------------------------\n📌 【新聞附錄 (前10則)】\n{news_links_block}"
+
+        # 訊息截斷機制（符合 LINE 5000 字限制）
+        if len(message) > 4000:
+            message = message[:3900] + "\n\n...(訊息過長，已自動截斷)"
+
+        # 發送推播
+        line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=message))
+        print("推播發送成功！")
+
+    except Exception as e:
+        print(f"執行失敗: {e}")
+
+if __name__ == '__main__':
+    main()
