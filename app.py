@@ -96,7 +96,7 @@ def generate_ai_summary(news_list):
             prompt = f"請針對以下第 {idx} 組新聞標題進行重點提煉（條列 2-3 個核心重點）：\n\n{raw_text}"
             
             res = client.models.generate_content(
-                model='gemini-2.0-flash',
+                model='gemini-3.6-flash',
                 contents=prompt,
             )
             partial_summaries.append(res.text.strip())
@@ -117,7 +117,7 @@ def generate_ai_summary(news_list):
 """
 
         final_res = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-3.6-flash',
             contents=final_prompt,
         )
         return final_res.text.strip()
