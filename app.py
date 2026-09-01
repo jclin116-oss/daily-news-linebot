@@ -74,7 +74,7 @@ def fetch_google_news(keywords_str, hours):
     return sorted(unique_news, key=lambda x: x['timestamp'], reverse=True)
 
 def generate_ai_summary(news_list):
-    """分批處理所有新聞後進行綜合總結，確保完整覆蓋"""
+    """分批處理新聞並依「各縣市」分類整理總結"""
     if not GEMINI_API_KEY:
         return "（未設定 GEMINI_API_KEY，無法生成總結）"
     if not news_list:
@@ -82,18 +82,18 @@ def generate_ai_summary(news_list):
 
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
-        chunk_size = 20  # 每 20 則新聞分為一組
+        chunk_size = 20
         chunks = [news_list[i:i + chunk_size] for i in range(0, len(news_list), chunk_size)]
         
         partial_summaries = []
 
-        # 第一階段：分批提煉小總結
+        # 第一階段：分批提煉
         for idx, chunk in enumerate(chunks, 1):
             raw_text = ""
             for n_idx, item in enumerate(chunk, 1):
                 raw_text += f"{n_idx}. [{item['source']}] {item['title']} ({item['time']})\n"
             
-            prompt = f"請針對以下第 {idx} 組新聞標題進行重點提煉（條列 2-3 個核心重點）：\n\n{raw_text}"
+            prompt = f"請針對以下新聞進行提煉，初步將新聞依涉及的縣市或區域整理（無 markdown 符號）：\n\n{raw_text}"
             
             res = client.models.generate_content(
                 model='gemini-3.6-flash',
@@ -101,17 +101,31 @@ def generate_ai_summary(news_list):
             )
             partial_summaries.append(res.text.strip())
 
-        # 第二階段：整合所有批次的總結
+        # 第二階段：依縣市彙整最終報告
         combined_text = "\n\n".join(partial_summaries)
         final_prompt = f"""
-以下是針對過去 {SEARCH_HOURS} 小時內共 {len(news_list)} 則新聞分組提煉出的重點摘要：
+以下是過去 {SEARCH_HOURS} 小時內共 {len(news_list)} 則新聞的提煉摘要：
 
 {combined_text}
 
-請扮演專業輿情分析師，整合上述資料並產出各縣市重點新聞報告(「禁止使用 Markdown 符號（如 #, * 等）」，並指定使用全形符號（如 【】、・）或 Emoji 來做層級排版)：
-1. **各縣市新聞速覽**：分類各縣市事件重點（條列說明，全國性就列為全國性）。
+請扮演專業資訊分析師，將上述新聞**完全依照「縣市」分類**整理成綜合報告。
 
-要求：文字精煉、客觀，直接輸出報告內容即可。
+格式嚴格要求：
+1. 嚴禁使用任何 Markdown 符號（絕對不要出現 #、*、**、` 等）。
+2. 不要輸出任何字數統計註記（如 (46字)）。
+3. 全文直接按「【縣市名稱】」分類條列重點（若為中央政策或全國性新聞，可獨立歸類在【全國／中央政策】）。
+
+排版範例：
+
+【基隆市】
+・ 事件一簡述與進展...
+・ 事件二簡述與進展...
+
+【新北市】
+・ 事件一簡述與進展...
+
+【全國／中央政策】（若無可省略）
+・ 政策或議題簡述...
 """
 
         final_res = client.models.generate_content(
