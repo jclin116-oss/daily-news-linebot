@@ -13,7 +13,7 @@ LINE_USER_ID = os.environ.get('LINE_USER_ID')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 # 自訂搜尋關鍵字與時間範圍
-KEYWORDS = "基隆"  # 可依需求修改關鍵字，多個關鍵字可用逗號分隔，如 "基隆, 台電"
+KEYWORDS = "台電"  # 可依需求修改關鍵字，多個關鍵字可用逗號分隔，如 "基隆, 台電"
 SEARCH_HOURS = 24
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
@@ -74,40 +74,57 @@ def fetch_google_news(keywords_str, hours):
     return sorted(unique_news, key=lambda x: x['timestamp'], reverse=True)
 
 def generate_ai_summary(news_list):
-    """將所有新聞打包交給 AI 生成整體總結報告（單次 API 呼叫）"""
+    """分批處理所有新聞後進行綜合總結，確保完整覆蓋"""
     if not GEMINI_API_KEY:
         return "（未設定 GEMINI_API_KEY，無法生成總結）"
     if not news_list:
         return "近時間內無相關新聞，無需總結。"
 
-    # 彙整所有新聞清單
-    raw_news_text = ""
-    for idx, item in enumerate(news_list, 1):
-        raw_news_text += f"{idx}. [{item['source']}] {item['title']} ({item['time']})\n"
-
-    prompt = f"""
-以下是過去 {SEARCH_HOURS} 小時內爬取到的新聞標題列表：
-
-{raw_news_text}
-
-請扮演專業資訊分析師，針對上述新聞進行整體綜合總結：
-1. **重點速覽**：歸納出 3~5 個核心主題/事件重點（條列說明）。
-2. **輿情與關注焦點**：是否有需要特別留意、追蹤或高關注度的突發/重要議題。
-3. **結論簡評**：用 1-2 句話做整體總結。
-
-要求：文字精煉、客觀，直接輸出總結報告內容即可。
-"""
-
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model='gemini-3.0-flash',
-            contents=prompt,
+        chunk_size = 20  # 每 20 則新聞分為一組
+        chunks = [news_list[i:i + chunk_size] for i in range(0, len(news_list), chunk_size)]
+        
+        partial_summaries = []
+
+        # 第一階段：分批提煉小總結
+        for idx, chunk in enumerate(chunks, 1):
+            raw_text = ""
+            for n_idx, item in enumerate(chunk, 1):
+                raw_text += f"{n_idx}. [{item['source']}] {item['title']} ({item['time']})\n"
+            
+            prompt = f"請針對以下第 {idx} 組新聞標題進行重點提煉（條列 2-3 個核心重點）：\n\n{raw_text}"
+            
+            res = client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=prompt,
+            )
+            partial_summaries.append(res.text.strip())
+
+        # 第二階段：整合所有批次的總結
+        combined_text = "\n\n".join(partial_summaries)
+        final_prompt = f"""
+以下是針對過去 {SEARCH_HOURS} 小時內共 {len(news_list)} 則新聞分組提煉出的重點摘要：
+
+{combined_text}
+
+請扮演專業資訊分析師，整合上述資料並產出最終綜合總結報告：
+1. **重點速覽**：歸納出 3~5 個核心主題/事件重點（條列說明）。
+2. **輿情與關注焦點**：特別留意高關注度、突發或需追蹤之議題。
+3. **結論簡評**：1-2 句話做整體總結。
+
+要求：文字精煉、客觀，直接輸出報告內容即可。
+"""
+
+        final_res = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=final_prompt,
         )
-        return response.text.strip()
+        return final_res.text.strip()
+
     except Exception as e:
         print(f"DEBUG: AI 生成失敗: {e}")
-        return "（AI 總結生成失敗）"
+        return f"（AI 總結生成失敗，原因：{e}）"
 
 def main():
     try:
