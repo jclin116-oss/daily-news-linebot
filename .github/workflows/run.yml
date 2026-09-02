@@ -1,9 +1,9 @@
 name: Run Daily News Summary
 
 on:
-  schedule:
+  #schedule:
     # 每天台灣時間早上 08:00 自動執行 (UTC 00:00)
-    - cron: '0 0 * * *'
+    #- cron: '0 0 * * *'
   # 支援在 GitHub 頁面手動點選按鈕觸發
   workflow_dispatch:
 
